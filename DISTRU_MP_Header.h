@@ -10,7 +10,7 @@ int good = 0, go = 1, start = 1, over = 0, found = 0, val = 0;
 M R, B, S, T, F;
 
 // Game Function Declarations
-void clear(M pos);
+void clear(M pos); // should this be Remove 
 void replace(M pos);
 void expand(M pos);
 void update(M pos);
