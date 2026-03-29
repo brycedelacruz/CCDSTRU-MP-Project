@@ -3,6 +3,13 @@
    De La Salle University
    Department of Software Technology
 
+   Group: 5
+
+   Names:
+   Chionglo, Iñigo Sancti Demegilio
+   Dela Cruz, Bryce Zalen Lanoy
+   Delantar, Dawn Heline Geneta
+
    Compile: gcc ccdstru.c -o ccdstru
    Run:     ./ccdstru
 
