@@ -344,11 +344,6 @@ void Remove(GameState *gs, Pos pos)
      (found ^ pos not in S) -> S = S U {pos} ^ found = false
      (found ^ pos in S ^ pos not in T) -> T = T U {pos} ^ Expand(pos)
 
-   FIX (correctness): changed flat if-if-if to if-else if-else so that
-     after removing pos from the enemy set, it is NOT also added to the
-     current player's set in the same call (mutual exclusivity).
-   FIX (rule): removed early return for invalid pos; guarded entire
-     body with an if block instead.
    ========================================================= */
 
 void Replace(GameState *gs, Pos pos)
