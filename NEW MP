@@ -241,9 +241,7 @@ void printResult(GameState *gs)
 
 /* Reads a row and column from stdin.
    Returns TRUE on valid input, FALSE otherwise.
-   FIX: removed early return statements; uses a single return at the end
-        with a result flag. The scanf flush loop no longer uses a bare
-        semicolon — flushing is done via the flag path with getchar(). */
+    */
 int promptPos(const char *prompt, Pos *out)
 {
     int r, c, ch;
@@ -491,8 +489,6 @@ void GameOver(GameState *gs)
 
 /* =========================================================
    MAIN - Game loop
-   FIX: removed all three continue statements; input validation is now
-        done entirely through the do-while condition and flag variables.
    ========================================================= */
 
 int main(void)
