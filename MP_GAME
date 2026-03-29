@@ -1,0 +1,925 @@
+/* =========================================================
+   CCDSTRU MP - Term 2, AY 2025-2026
+   De La Salle University
+   Department of Software Technology
+
+   Compile: gcc ccdstru.c -o ccdstru
+   Run:     ./ccdstru
+
+   Applicable Sets (from spec):
+     C = { x in Z+ | x < 4 }          -> {1, 2, 3}
+     N = { x in Z+ U {0} | x <= 16 }  -> {0, 1, ..., 16}
+     M = C x C                         -> 3x3 grid of positions
+     V = {true, false}
+
+   System Variables (from spec):
+     good  in V      - tracks if the current move was valid
+     go    in V      - TRUE = Red's turn, FALSE = Blue's turn
+     start in V      - TRUE while in the placement phase
+     over  in V      - TRUE when a game-ending condition is met
+     found in V      - used internally during Replace/Expand
+     val   in N      - total number of valid moves made
+     R, B, S, T, F  - all subsets of M
+       R = Red pieces on the board
+       B = Blue pieces on the board
+       S = positions ever selected by either player
+       T = positions that have already exploded (via Expand)
+       F = M - (R U B), the free (unoccupied) cells
+   ========================================================= */
+
+#include <stdio.h>
+
+/* =========================================================
+   CONSTANTS
+   Derived from the Applicable Sets in the spec:
+     C = {1,2,3}  ->  GRID = 3  (one side of M = C x C)
+     |M| = 3*3    ->  MAX_CELLS = 9
+     val >= 20    ->  VAL_LIMIT = 20  (over condition)
+     |F| = 3      ->  FREE_LIMIT = 3  (over condition)
+   ========================================================= */
+
+#define GRID       3   /* C = {1,2,3}: row and col range 1 to 3  */
+#define MAX_CELLS  9   /* |M| = GRID * GRID = 9 total cells       */
+#define VAL_LIMIT  20  /* over is true when val >= 20             */
+#define FREE_LIMIT 3   /* over is true when |F| = 3               */
+
+/* =========================================================
+   TYPES
+   ========================================================= */
+
+/* V = {true, false} represented as int in C */
+typedef int bool;
+#define TRUE  1
+#define FALSE 0
+
+/*
+ * Pos - a single element of M = C x C
+ * Spec: M = C x C, where C = {1, 2, 3}
+ * row and col are each in {1, 2, 3}
+ */
+typedef struct {
+    int row;   /* element of C: 1, 2, or 3 */
+    int col;   /* element of C: 1, 2, or 3 */
+} Pos;
+
+/*
+ * PosSet - a subset of M, stored as a fixed-size array of Pos.
+ * Spec: R, B, S, T, F are all subsets of M.
+ * size tracks how many elements are currently in the set.
+ */
+typedef struct {
+    Pos cells[MAX_CELLS];
+    int size;
+} PosSet;
+
+/*
+ * GameState - holds all system variables defined in the spec.
+ * Spec: System Variables section.
+ *   good  in V
+ *   go    in V
+ *   start in V
+ *   over  in V
+ *   found in V
+ *   val   in N
+ *   R, B, S, T, F subsets of M
+ * Note: F is not stored explicitly; it is computed via freeCount().
+ */
+typedef struct {
+    int    good;   /* in V: was the last move valid?              */
+    int    go;     /* in V: TRUE = Red's turn, FALSE = Blue's     */
+    int    start;  /* in V: TRUE = placement phase still active   */
+    int    over;   /* in V: TRUE = game has ended                 */
+    int    found;  /* in V: used by Replace to detect captures    */
+    int    val;    /* in N: total valid moves made, 0..VAL_LIMIT  */
+    PosSet R;      /* subset of M: Red's pieces on the board      */
+    PosSet B;      /* subset of M: Blue's pieces on the board     */
+    PosSet S;      /* subset of M: all positions ever selected    */
+    PosSet T;      /* subset of M: all positions that exploded    */
+} GameState;
+
+/* =========================================================
+   FORWARD DECLARATIONS
+   ========================================================= */
+
+/* Set operations */
+int  posEqual(Pos a, Pos b);
+int  inSet(PosSet *set, Pos p);
+void addToSet(PosSet *set, Pos p);
+void removeFromSet(PosSet *set, Pos p);
+int  freeCount(GameState *gs);
+int  validPos(Pos p);
+
+/* Display */
+void clearScreen(void);
+void printBoard(GameState *gs);
+void printState(GameState *gs);
+void printResult(GameState *gs);
+int  promptPos(const char *prompt, Pos *out);
+
+/* Game logic */
+void initGame(GameState *gs);
+int  checkOver(GameState *gs);
+void Remove(GameState *gs, Pos pos);
+void Replace(GameState *gs, Pos pos);
+void Expand(GameState *gs, Pos pos);
+void Update(GameState *gs, Pos pos);
+void NextPlayerMove(GameState *gs, Pos pos);
+void GameOver(GameState *gs);
+
+/* =========================================================
+   SET OPERATIONS
+   Helper functions for working with subsets of M.
+   The spec uses standard set notation: union (U), difference
+   (-), membership (in), and cardinality (|.|).
+   ========================================================= */
+
+/*
+ * posEqual - checks if two positions in M are the same cell.
+ * Used by inSet, addToSet, and removeFromSet to compare elements
+ * of M = C x C by matching both row and col.
+ */
+int posEqual(Pos a, Pos b)
+{
+    return (a.row == b.row && a.col == b.col);
+}
+
+/*
+ * inSet - checks membership: returns TRUE if p is in set.
+ * Spec notation: "pos in R", "pos in B", "pos in S", "pos in T"
+ * Scans the cells array linearly since |M| <= 9.
+ */
+int inSet(PosSet *set, Pos p)
+{
+    int i;
+    for (i = 0; i < set->size; i++)
+        if (posEqual(set->cells[i], p))
+            return TRUE;
+    return FALSE;
+}
+
+/*
+ * addToSet - set union with a single element: set = set U {p}
+ * Spec notation: "R = R U {pos}", "S = S U {pos}", etc.
+ * Only adds p if it is not already present (sets have no duplicates).
+ */
+void addToSet(PosSet *set, Pos p)
+{
+    if (!inSet(set, p) && set->size < MAX_CELLS) {
+        set->cells[set->size] = p;
+        set->size++;
+    }
+}
+
+/*
+ * removeFromSet - set difference with a single element: set = set - {p}
+ * Spec notation: "R = R - {pos}", "B = B - {pos}", "S = S - {pos}", etc.
+ * Shifts remaining elements left to fill the gap left by the removed cell.
+ */
+void removeFromSet(PosSet *set, Pos p)
+{
+    int i, j;
+    for (i = 0; i < set->size; i++) {
+        if (posEqual(set->cells[i], p)) {
+            for (j = i; j < set->size - 1; j++)
+                set->cells[j] = set->cells[j + 1];
+            set->size--;
+            return;
+        }
+    }
+}
+
+/*
+ * freeCount - computes |F| where F = M - (R U B).
+ * Spec (System Facts): F = M - (R U B)
+ * Iterates over all 9 cells of M and counts those not in R and not in B.
+ * Used by checkOver() to evaluate the |F| = 3 game-end condition.
+ */
+int freeCount(GameState *gs)
+{
+    int r, c, count;
+    Pos p;
+
+    count = 0;
+    for (r = 1; r <= GRID; r++) {
+        for (c = 1; c <= GRID; c++) {
+            p.row = r;
+            p.col = c;
+            if (!inSet(&gs->R, p) && !inSet(&gs->B, p))
+                count++;
+        }
+    }
+    return count;
+}
+
+/*
+ * validPos - checks if a position is within M = C x C.
+ * Spec: all operations take pos in M as their domain.
+ * Used by Replace() to guard out-of-bounds neighbor cells
+ * that Expand() may compute (e.g., row 0 or col 4 do not exist in M).
+ */
+int validPos(Pos p)
+{
+    return (p.row >= 1 && p.row <= GRID &&
+            p.col >= 1 && p.col <= GRID);
+}
+
+/* =========================================================
+   DISPLAY
+   UI helpers - not part of the formal spec but required
+   to make the system interactive and observable.
+   ========================================================= */
+
+/*
+ * clearScreen - clears the terminal between player turns.
+ * Uses ANSI escape codes: ESC[2J clears the screen,
+ * ESC[H moves the cursor to the top-left corner.
+ * Called every time control passes from one player to the other
+ * so each player only sees the current board state.
+ */
+void clearScreen(void)
+{
+    printf("\033[2J\033[H");
+}
+
+/*
+ * printBoard - renders the current state of M on screen.
+ * Shows each cell of M = C x C labeled by row and col.
+ * Displays 'R' for cells in R, 'B' for cells in B,
+ * and '.' for cells in F (free cells, i.e., M - (R U B)).
+ */
+void printBoard(GameState *gs)
+{
+    int r, c;
+    Pos p;
+
+    printf("\n     Col1  Col2  Col3\n");
+    printf("    +-----+-----+-----+\n");
+    for (r = 1; r <= GRID; r++) {
+        printf("Row%d|", r);
+        for (c = 1; c <= GRID; c++) {
+            p.row = r;
+            p.col = c;
+            if      (inSet(&gs->R, p)) printf("  R  |");
+            else if (inSet(&gs->B, p)) printf("  B  |");
+            else                       printf("  .  |");
+        }
+        printf("\n    +-----+-----+-----+\n");
+    }
+    printf("\n");
+}
+
+/*
+ * printState - displays all system variable values.
+ * Shows val, |R|, |B|, |F|, go, start, over, S, and T.
+ * Corresponds directly to the System Variables section of the spec.
+ * Useful for tracing game behavior against the formal definitions.
+ */
+void printState(GameState *gs)
+{
+    int i;
+
+    printf("--- State: val=%d  |R|=%d  |B|=%d  |F|=%d  "
+           "go=%s  start=%s  over=%s ---\n",
+           gs->val,
+           gs->R.size, gs->B.size, freeCount(gs),
+           gs->go    ? "Red"  : "Blue",
+           gs->start ? "yes"  : "no",
+           gs->over  ? "yes"  : "no");
+
+    printf("  S={ ");
+    for (i = 0; i < gs->S.size; i++)
+        printf("(%d,%d) ", gs->S.cells[i].row, gs->S.cells[i].col);
+    printf("}  T={ ");
+    for (i = 0; i < gs->T.size; i++)
+        printf("(%d,%d) ", gs->T.cells[i].row, gs->T.cells[i].col);
+    printf("}\n\n");
+}
+
+/*
+ * printResult - displays the final outcome of the game.
+ * Spec (GameOver): result in {"R wins", "B wins", "draw"}
+ *   (over ^ |R| > |B|) -> result = "R wins"
+ *   (over ^ |R| < |B|) -> result = "B wins"
+ *   (over ^ |R| = |B|) -> result = "draw"
+ * Called only after over becomes TRUE.
+ */
+void printResult(GameState *gs)
+{
+    printf("========================================\n");
+    printf("              GAME OVER\n");
+    printf("========================================\n");
+    printf("  Red pieces  : %d\n", gs->R.size);
+    printf("  Blue pieces : %d\n", gs->B.size);
+    printf("  Moves made  : %d\n", gs->val);
+    printf("  Result      : ");
+
+    if      (gs->R.size > gs->B.size) printf("RED WINS!\n");
+    else if (gs->R.size < gs->B.size) printf("BLUE WINS!\n");
+    else                               printf("DRAW\n");
+
+    printf("========================================\n\n");
+}
+
+/*
+ * promptPos - reads a position (row col) from the player.
+ * Validates that both values are in C = {1, 2, 3}.
+ * Returns TRUE if input is valid, FALSE otherwise.
+ * Flushes bad input from stdin to prevent infinite loops.
+ */
+int promptPos(const char *prompt, Pos *out)
+{
+    int r, c, ch;
+
+    printf("%s (row col, e.g. 1 2): ", prompt);
+    if (scanf("%d %d", &r, &c) != 2) {
+        /* flush any non-integer characters from the input buffer */
+        while ((ch = getchar()) != '\n' && ch != EOF);
+        return FALSE;
+    }
+    if (r < 1 || r > GRID || c < 1 || c > GRID) {
+        printf("  [!] Row and col must each be 1, 2, or 3.\n");
+        return FALSE;
+    }
+    out->row = r;
+    out->col = c;
+    return TRUE;
+}
+
+/* =========================================================
+   SYSTEM INITIALIZATION
+   Spec (System Initialization):
+     good  = false
+     go    = true
+     start = true
+     found = false
+     val   = 0
+     R = {}
+     B = {}
+     S = {}
+     T = {}
+   ========================================================= */
+
+/*
+ * initGame - sets all system variables to their initial values.
+ * Directly implements the System Initialization section of the spec.
+ * go = TRUE means Red always takes the first turn.
+ * All sets R, B, S, T start empty (size = 0).
+ */
+void initGame(GameState *gs)
+{
+    gs->good   = FALSE; /* good  = false */
+    gs->go     = TRUE;  /* go    = true  */
+    gs->start  = TRUE;  /* start = true  */
+    gs->over   = FALSE; /* over  = false */
+    gs->found  = FALSE; /* found = false */
+    gs->val    = 0;     /* val   = 0     */
+    gs->R.size = 0;     /* R = {}        */
+    gs->B.size = 0;     /* B = {}        */
+    gs->S.size = 0;     /* S = {}        */
+    gs->T.size = 0;     /* T = {}        */
+}
+
+/* =========================================================
+   SYSTEM FACTS
+   Spec:
+     F    = M - (R U B)
+     over <-> ( |F| = 3
+              v val >= 20
+              v (not start ^ (|R| > 0 ^ |B| = 0
+                           v  |R| = 0 ^ |B| > 0)) )
+   ========================================================= */
+
+/*
+ * checkOver - evaluates the over biconditional from the spec.
+ * Returns TRUE (over = true) if ANY of these conditions hold:
+ *   1. |F| = 3         : only 3 free cells remain on the board
+ *   2. val >= 20       : 20 or more total moves have been made
+ *   3. not start AND   : the placement phase is over AND
+ *      one side is wiped out: (|R|>0 ^ |B|=0) OR (|R|=0 ^ |B|>0)
+ * Condition 3 checks that start is FALSE first because during
+ * the start phase it is normal for one player to have no pieces yet.
+ */
+int checkOver(GameState *gs)
+{
+    int f = freeCount(gs); /* |F| = |M - (R U B)|              */
+    int r = gs->R.size;    /* |R|                               */
+    int b = gs->B.size;    /* |B|                               */
+
+    if (f == FREE_LIMIT)                           return TRUE; /* |F| = 3      */
+    if (gs->val >= VAL_LIMIT)                      return TRUE; /* val >= 20     */
+    if (!gs->start && ((r > 0 && b == 0) ||
+                       (r == 0 && b > 0)))         return TRUE; /* one side gone */
+    return FALSE;
+}
+
+/* =========================================================
+   SYSTEM STATE: Remove(pos in M)
+   Spec:
+     go  -> ( R = R - {pos} )
+     ~go -> ( B = B - {pos} )
+     S = S - {pos}
+     T = T - {pos}
+   ========================================================= */
+
+/*
+ * Remove - removes pos from the current player's set and from S and T.
+ * Spec: Remove(pos in M)
+ *   If go (Red's turn):   R = R - {pos}
+ *   If not go (Blue's turn): B = B - {pos}
+ *   Always: S = S - {pos}, T = T - {pos}
+ * Called at the start of Expand() to erase the exploding piece
+ * before spreading to neighbors. Removing from S and T resets
+ * pos so it could theoretically be re-selected in future turns.
+ */
+void Remove(GameState *gs, Pos pos)
+{
+    /* go  -> R = R - {pos} */
+    /* ~go -> B = B - {pos} */
+    if (gs->go)
+        removeFromSet(&gs->R, pos);
+    else
+        removeFromSet(&gs->B, pos);
+
+    /* S = S - {pos} */
+    removeFromSet(&gs->S, pos);
+
+    /* T = T - {pos} */
+    removeFromSet(&gs->T, pos);
+}
+
+/* =========================================================
+   SYSTEM STATE: Replace(pos in M)
+   Spec:
+     found = false
+     (go  ^ pos in B)     -> B = B - {pos} ^ found = true   [capture]
+     (go  ^ pos in R)     -> found = true                   [own cell]
+     (go  ^ pos not in R) -> R = R U {pos}                  [claim]
+     (~go ^ pos in R)     -> R = R - {pos} ^ found = true   [capture]
+     (~go ^ pos in B)     -> found = true                   [own cell]
+     (~go ^ pos not in B) -> B = B U {pos}                  [claim]
+     (found ^ pos not in S) -> S = S U {pos} ^ found = false
+     (found ^ pos in S ^ pos not in T) -> T = T U {pos} ^ Expand(pos)
+   ========================================================= */
+
+/*
+ * Replace - places the current player's piece at pos, handling
+ * all three cases: free cell, own cell, and opponent's cell.
+ *
+ * Case: free cell (pos not in R and not in B)
+ *   The current player's piece is placed at pos.
+ *   go  -> R = R U {pos}
+ *   ~go -> B = B U {pos}
+ *
+ * Case: own cell (pos already in current player's set)
+ *   found is set to TRUE but the set is unchanged (no stacking).
+ *
+ * Case: opponent's cell (pos in the other player's set)
+ *   The opponent's piece is removed (captured) and the current
+ *   player's piece is placed instead. found is set to TRUE.
+ *
+ * Chain reaction (triggered when found = TRUE after a capture):
+ *   If the captured cell was never selected (pos not in S):
+ *     S = S U {pos}, found = FALSE. No explosion yet.
+ *   If the captured cell was already in S but not yet exploded (pos not in T):
+ *     T = T U {pos} and Expand(pos) is called recursively.
+ *
+ * validPos() guards neighbor cells from Expand() that may lie
+ * outside M (e.g., row 0 or col 4 are not in C = {1,2,3}).
+ */
+void Replace(GameState *gs, Pos pos)
+{
+    /* pos must be inside M = C x C */
+    if (!validPos(pos))
+        return;
+
+    /* found = false */
+    gs->found = FALSE;
+
+    if (gs->go) {
+        /* --- Red's turn --- */
+
+        /* (go ^ pos in B) -> B = B - {pos} ^ found = true  [capture Blue] */
+        if (inSet(&gs->B, pos)) {
+            removeFromSet(&gs->B, pos);
+            gs->found = TRUE;
+        }
+        /* (go ^ pos in R) -> found = true  [own cell, R unchanged] */
+        if (inSet(&gs->R, pos)) {
+            gs->found = TRUE;
+        }
+        /* (go ^ pos not in R) -> R = R U {pos}  [claim free or captured cell] */
+        if (!inSet(&gs->R, pos)) {
+            addToSet(&gs->R, pos);
+        }
+    } else {
+        /* --- Blue's turn --- */
+
+        /* (~go ^ pos in R) -> R = R - {pos} ^ found = true  [capture Red] */
+        if (inSet(&gs->R, pos)) {
+            removeFromSet(&gs->R, pos);
+            gs->found = TRUE;
+        }
+        /* (~go ^ pos in B) -> found = true  [own cell, B unchanged] */
+        if (inSet(&gs->B, pos)) {
+            gs->found = TRUE;
+        }
+        /* (~go ^ pos not in B) -> B = B U {pos}  [claim free or captured cell] */
+        if (!inSet(&gs->B, pos)) {
+            addToSet(&gs->B, pos);
+        }
+    }
+
+    /* (found ^ pos not in S) -> S = S U {pos} ^ found = false
+       A capture occurred and pos was never selected before.
+       Track it in S but do not explode; reset found to FALSE. */
+    if (gs->found && !inSet(&gs->S, pos)) {
+        addToSet(&gs->S, pos);
+        gs->found = FALSE;
+    }
+
+    /* (found ^ pos in S ^ pos not in T) -> T = T U {pos} ^ Expand(pos)
+       A capture occurred and pos was already in S (previously selected)
+       but has not yet exploded (not in T).
+       Mark it as exploded and trigger a recursive chain expansion. */
+    if (gs->found && inSet(&gs->S, pos) && !inSet(&gs->T, pos)) {
+        addToSet(&gs->T, pos);
+        Expand(gs, pos); /* recursive chain reaction */
+    }
+}
+
+/* =========================================================
+   SYSTEM STATE: Expand(pos in M)
+   Spec:
+     (a, b) = pos
+     u = (a-1, b)   [UP]
+     d = (a+1, b)   [DOWN]
+     k = (a, b-1)   [LEFT]
+     r = (a, b+1)   [RIGHT]
+     Remove(pos)
+     go  -> Replace(u)   [Red spreads UP]
+     ~go -> Replace(d)   [Blue spreads DOWN]
+     Replace(k)          [both spread LEFT]
+     Replace(r)          [both spread RIGHT]
+   ========================================================= */
+
+/*
+ * Expand - removes the exploding piece and spreads to 3 neighbors.
+ * Spec: Expand(pos in M)
+ *
+ * Step 1: Compute the four cardinal neighbors of pos = (a, b):
+ *   u = (a-1, b) UP, d = (a+1, b) DOWN,
+ *   k = (a, b-1) LEFT, r = (a, b+1) RIGHT
+ *
+ * Step 2: Remove(pos) erases the piece from the board and clears
+ *   pos from both S and T so the cell is clean for redistribution.
+ *
+ * Step 3: Spread to three neighbors based on go:
+ *   Red  (go = TRUE):  Replace(u), Replace(k), Replace(r)
+ *   Blue (go = FALSE): Replace(d), Replace(k), Replace(r)
+ *
+ * Replace() may call Expand() again recursively if a neighbor
+ * triggers another chain reaction (captured cell in S but not in T).
+ * Neighbors outside M are silently ignored by validPos() in Replace().
+ */
+void Expand(GameState *gs, Pos pos)
+{
+    Pos u, d, k, r;
+
+    /* (a,b) = pos; compute all four cardinal neighbors */
+    u.row = pos.row - 1;  u.col = pos.col;     /* u = (a-1, b) UP    */
+    d.row = pos.row + 1;  d.col = pos.col;     /* d = (a+1, b) DOWN  */
+    k.row = pos.row;      k.col = pos.col - 1; /* k = (a, b-1) LEFT  */
+    r.row = pos.row;      r.col = pos.col + 1; /* r = (a, b+1) RIGHT */
+
+    /* Remove(pos): erase the exploding piece from the board */
+    Remove(gs, pos);
+
+    /* go  -> Replace(u): Red spreads to the cell directly above   */
+    /* ~go -> Replace(d): Blue spreads to the cell directly below  */
+    if (gs->go)
+        Replace(gs, u);
+    else
+        Replace(gs, d);
+
+    /* Replace(k): both players spread to the cell on the left  */
+    Replace(gs, k);
+
+    /* Replace(r): both players spread to the cell on the right */
+    Replace(gs, r);
+}
+
+/* =========================================================
+   SYSTEM STATE: Update(pos in M)
+   Spec:
+     good = false
+     (pos not in S) -> S = S U {pos} ^ good = ~good
+     (~good ^ pos in S ^ pos not in T) -> T = T U {pos} ^ Expand(pos)
+   ========================================================= */
+
+/*
+ * Update - handles a player selecting one of their own pieces.
+ * Spec: Update(pos in M)
+ * Called by NextPlayerMove() during the main game phase (start = FALSE).
+ *
+ * The behavior depends on pos membership in S and T:
+ *
+ *   Case 1 - pos not in S (1st time this cell is ever selected):
+ *     S = S U {pos}, good = ~good (good becomes TRUE).
+ *     The piece stays on the board. No explosion.
+ *
+ *   Case 2 - pos in S and not in T (2nd time this cell is selected):
+ *     good remains FALSE (Case 1 condition was false, good not toggled).
+ *     T = T U {pos} and Expand(pos) is called. The piece EXPLODES.
+ *
+ *   Case 3 - pos in T (already exploded in a previous turn):
+ *     Neither condition fires. good stays FALSE. No effect on the board.
+ */
+void Update(GameState *gs, Pos pos)
+{
+    /* good = false */
+    gs->good = FALSE;
+
+    /* (pos not in S) -> S = S U {pos} ^ good = ~good
+       First selection of this cell: track it and signal a valid move. */
+    if (!inSet(&gs->S, pos)) {
+        addToSet(&gs->S, pos);
+        gs->good = !gs->good; /* good becomes TRUE */
+    }
+
+    /* (~good ^ pos in S ^ pos not in T) -> T = T U {pos} ^ Expand(pos)
+       good is FALSE means Case 1 did not run (pos was already in S).
+       pos is in S and not yet in T: trigger explosion. */
+    if (!gs->good && inSet(&gs->S, pos) && !inSet(&gs->T, pos)) {
+        addToSet(&gs->T, pos);
+        Expand(gs, pos); /* piece explodes and spreads to neighbors */
+    }
+}
+
+/* =========================================================
+   SYSTEM STATE: NextPlayerMove(pos in M)
+   Spec:
+     (~over ^ start ^  go) -> R=R U {pos} ^ S=S U {pos} ^ good=true
+     (~over ^ start ^ ~go) -> B=B U {pos} ^ S=S U {pos} ^ good=true
+     (~over ^ ~start ^ (go ^ pos in R  v  ~go ^ pos in B))
+                           -> Update(pos) ^ good=true
+     (start ^ |R|=1 ^ |B|=1) -> start=false
+     (~over ^ good) -> good=~good ^ go=~go ^ val=val+1
+   ========================================================= */
+
+/*
+ * NextPlayerMove - the main entry point for each player's action.
+ * Spec: NextPlayerMove(pos in M)
+ *
+ * START PHASE (start = TRUE):
+ *   (~over ^ start ^ go):
+ *     Red places first piece: R = R U {pos}, S = S U {pos}, good = TRUE
+ *   (~over ^ start ^ ~go):
+ *     Blue places first piece: B = B U {pos}, S = S U {pos}, good = TRUE
+ *   (start ^ |R|=1 ^ |B|=1):
+ *     Both have placed once; transition to main phase: start = FALSE
+ *
+ * MAIN PHASE (start = FALSE):
+ *   (~over ^ ~start ^ go ^ pos in R) OR (~over ^ ~start ^ ~go ^ pos in B):
+ *     Player selects their own piece: Update(pos), good = TRUE
+ *   Selecting an empty cell or the opponent's piece leaves good = FALSE
+ *   and the turn does not advance.
+ *
+ * TURN ADVANCEMENT (both phases):
+ *   (~over ^ good):
+ *     good = ~good  (reset to FALSE for next turn)
+ *     go   = ~go    (switch active player)
+ *     val  = val + 1 (increment move counter)
+ *
+ * over is re-evaluated at the start and end of each call.
+ */
+void NextPlayerMove(GameState *gs, Pos pos)
+{
+    /* evaluate over before processing the move */
+    gs->over = checkOver(gs);
+
+    /* (~over ^ start ^ go) -> R = R U {pos} ^ S = S U {pos} ^ good = true
+       Start phase, Red's turn: place Red's first piece anywhere. */
+    if (!gs->over && gs->start && gs->go) {
+        addToSet(&gs->R, pos);
+        addToSet(&gs->S, pos);
+        gs->good = TRUE;
+    }
+    /* (~over ^ start ^ ~go) -> B = B U {pos} ^ S = S U {pos} ^ good = true
+       Start phase, Blue's turn: place Blue's first piece anywhere. */
+    else if (!gs->over && gs->start && !gs->go) {
+        addToSet(&gs->B, pos);
+        addToSet(&gs->S, pos);
+        gs->good = TRUE;
+    }
+    /* (~over ^ ~start ^ (go ^ pos in R  v  ~go ^ pos in B))
+           -> Update(pos) ^ good = true
+       Main phase: player selects one of their own existing pieces. */
+    else if (!gs->over && !gs->start) {
+        if ((gs->go  && inSet(&gs->R, pos)) ||
+            (!gs->go && inSet(&gs->B, pos))) {
+            Update(gs, pos);
+            gs->good = TRUE;
+        }
+    }
+
+    /* (start ^ |R|=1 ^ |B|=1) -> start = false
+       Both players have placed their one piece; end the start phase. */
+    if (gs->start && gs->R.size == 1 && gs->B.size == 1)
+        gs->start = FALSE;
+
+    /* (~over ^ good) -> good = ~good ^ go = ~go ^ val = val + 1
+       A valid move was made: reset good, switch turns, count the move. */
+    if (!gs->over && gs->good) {
+        gs->good = !gs->good; /* good = ~good (resets to FALSE) */
+        gs->go   = !gs->go;   /* go   = ~go   (switch player)   */
+        gs->val++;             /* val  = val + 1                 */
+    }
+
+    /* re-evaluate over after the move has been applied */
+    gs->over = checkOver(gs);
+}
+
+/* =========================================================
+   SYSTEM STATE: GameOver()
+   Spec:
+     result in {"R wins", "B wins", "draw"}
+     (over ^ |R| > |B|) -> result = "R wins"
+     (over ^ |R| < |B|) -> result = "B wins"
+     (over ^ |R| = |B|) -> result = "draw"
+   ========================================================= */
+
+/*
+ * GameOver - determines and displays the final result.
+ * Spec: GameOver()
+ * Only called after over = TRUE (checkOver returned TRUE).
+ * Delegates result computation and display to printResult(),
+ * which applies the three outcome cases from the spec:
+ *   |R| > |B|  ->  Red wins
+ *   |R| < |B|  ->  Blue wins
+ *   |R| = |B|  ->  draw
+ */
+void GameOver(GameState *gs)
+{
+    printResult(gs);
+}
+
+/* =========================================================
+   MAIN - Game loop
+   Drives the full game sequence:
+     Step 1:   Start phase - each player places one piece
+     Step 2-5: Main phase  - players alternate selecting pieces
+     Step 6-7: Game over   - determine and display the winner
+   ========================================================= */
+
+int main(void)
+{
+    GameState gs;   /* holds all system variables from the spec */
+    Pos       pos;  /* the position chosen by the current player */
+    int       valid;
+    int       wasInS, wasInT;
+
+    /* System Initialization: set all variables to their spec defaults */
+    initGame(&gs);
+
+    /* --------------------------------------------------
+       STEP 1: START PHASE
+       Spec (NextPlayerMove, start = TRUE):
+         (~over ^ start ^ go)  -> R = R U {pos} ^ S = S U {pos}
+         (~over ^ start ^ ~go) -> B = B U {pos} ^ S = S U {pos}
+         (start ^ |R|=1 ^ |B|=1) -> start = false
+       Red always places first (go = TRUE at initialization).
+       Blue places second (go toggles to FALSE after Red's turn).
+       -------------------------------------------------- */
+
+    /* Red's placement turn (go = TRUE at game start) */
+    clearScreen();
+    printf("==========================================\n");
+    printf("   CCDSTRU  -  Term 2, AY 2025-2026\n");
+    printf("   De La Salle University\n");
+    printf("==========================================\n\n");
+    printf("[START PHASE]\n");
+    printf("Each player places ONE piece anywhere.\n\n");
+    printf("--- RED's turn to place ---\n");
+    printBoard(&gs);
+    do {
+        valid = promptPos("RED   place your piece", &pos);
+        if (!valid)
+            continue;
+        /* pos must be in F = M - (R U B): not already occupied */
+        if (inSet(&gs.R, pos) || inSet(&gs.B, pos)) {
+            printf("  [!] Cell already occupied. Choose another.\n");
+            valid = FALSE;
+        }
+    } while (!valid);
+    NextPlayerMove(&gs, pos); /* R = R U {pos}, S = S U {pos}, go -> ~go */
+    printf("  Red placed at (%d,%d).\n\n", pos.row, pos.col);
+
+    /* Blue's placement turn (go = FALSE after Red's turn) */
+    clearScreen();
+    printf("==========================================\n");
+    printf("   CCDSTRU  -  Term 2, AY 2025-2026\n");
+    printf("   De La Salle University\n");
+    printf("==========================================\n\n");
+    printf("[START PHASE]\n");
+    printf("Each player places ONE piece anywhere.\n\n");
+    printf("--- BLUE's turn to place ---\n");
+    printBoard(&gs);
+    do {
+        valid = promptPos("BLUE  place your piece", &pos);
+        if (!valid)
+            continue;
+        /* pos must be in F = M - (R U B): not already occupied */
+        if (inSet(&gs.R, pos) || inSet(&gs.B, pos)) {
+            printf("  [!] Cell already occupied. Choose another.\n");
+            valid = FALSE;
+        }
+    } while (!valid);
+    NextPlayerMove(&gs, pos); /* B = B U {pos}, S = S U {pos}, start = false */
+    printf("  Blue placed at (%d,%d).\n\n", pos.row, pos.col);
+
+    /* --------------------------------------------------
+       STEP 2-5: MAIN GAME LOOP
+       Spec (NextPlayerMove, start = FALSE):
+         (~over ^ ~start ^ go  ^ pos in R) -> Update(pos)
+         (~over ^ ~start ^ ~go ^ pos in B) -> Update(pos)
+       Update behavior per spec:
+         pos not in S           -> 1st pick, tracked, good = TRUE
+         pos in S, pos not in T -> 2nd pick, Expand fires
+         pos in T               -> already exploded, no effect
+       Loop continues while over = FALSE (checkOver returns FALSE).
+       -------------------------------------------------- */
+
+    while (!gs.over) {
+        /* clear screen on each turn so each player sees only
+           the current board state, not the other player's input */
+        clearScreen();
+        printf("==========================================\n");
+        printf("   CCDSTRU  -  Term 2, AY 2025-2026\n");
+        printf("   De La Salle University\n");
+        printf("==========================================\n\n");
+        printf("[MAIN GAME]\n");
+        printf("Pick one of YOUR pieces each turn.\n");
+        printf("  1st pick -> safe, piece is tracked in S\n");
+        printf("  2nd pick -> EXPLODES, spreads to neighbors\n\n");
+        printBoard(&gs);
+        printState(&gs);
+
+        printf("Turn %d  -  %s's turn\n",
+               gs.val + 1, gs.go ? "RED" : "BLUE");
+
+        /* enforce spec condition: (go ^ pos in R) OR (~go ^ pos in B) */
+        do {
+            valid = promptPos(
+                gs.go ? "RED   select your piece"
+                      : "BLUE  select your piece",
+                &pos);
+            if (!valid)
+                continue;
+            if (gs.go && !inSet(&gs.R, pos)) {
+                printf("  [!] That is not a Red piece.\n");
+                valid = FALSE;
+            } else if (!gs.go && !inSet(&gs.B, pos)) {
+                printf("  [!] That is not a Blue piece.\n");
+                valid = FALSE;
+            }
+        } while (!valid);
+
+        /* snapshot S and T membership before NextPlayerMove so we
+           can display accurate feedback after the state has changed */
+        wasInS = inSet(&gs.S, pos); /* TRUE -> this is the 2nd selection */
+        wasInT = inSet(&gs.T, pos); /* TRUE -> pos already exploded before */
+
+        /* apply the move: NextPlayerMove -> Update -> Expand -> Replace */
+        NextPlayerMove(&gs, pos);
+
+        /* feedback message corresponding to the three Update cases */
+        if (wasInT) {
+            /* pos in T: spec Update case 3 - already exploded, no effect */
+            printf("  (%d,%d) already exploded before - no effect.\n\n",
+                   pos.row, pos.col);
+        } else if (wasInS) {
+            /* pos in S, not in T: spec Update case 2 - Expand fired */
+            printf("  (%d,%d) EXPLODED! Spread to neighbors.\n\n",
+                   pos.row, pos.col);
+        } else {
+            /* pos not in S: spec Update case 1 - safe pick, added to S */
+            printf("  (%d,%d) selected and tracked (safe pick).\n\n",
+                   pos.row, pos.col);
+        }
+    }
+
+    /* --------------------------------------------------
+       STEP 6-7: GAME OVER
+       Spec (GameOver):
+         (over ^ |R| > |B|) -> result = "R wins"
+         (over ^ |R| < |B|) -> result = "B wins"
+         (over ^ |R| = |B|) -> result = "draw"
+       over became TRUE when checkOver() detected one of:
+         |F| = 3, val >= 20, or one side eliminated post-start.
+       -------------------------------------------------- */
+    clearScreen();
+    printBoard(&gs);
+    GameOver(&gs);
+
+    return 0;
+}
