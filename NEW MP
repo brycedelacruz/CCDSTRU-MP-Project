@@ -3,8 +3,12 @@
    De La Salle University
    Department of Software Technology
 
-   Compile: gcc MP_GAME2.c -o MP_GAME2
-   Run:     ./MP_GAME2
+   Group: 5
+
+   Names:
+   Chionglo, Iñigo Sancti Demegilio
+   Dela Cruz, Bryce Zalen Lanoy
+   Delantar, Dawn Heline Geneta
    ========================================================= */
 
 #include <stdio.h>
